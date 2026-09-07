@@ -2,7 +2,7 @@
   "rewrites": [
     {
       "source": "/api/(.*)",
-      "destination": "https://student-print.onrender.com"
+      "destination": "https://student-print.onrender.com/api/$1"
     },
     {
       "source": "/(.*)",
