@@ -26,12 +26,15 @@ const SORT_OPTIONS = [
 ];
 
 function studentName(order: Order) {
-  const s = order.studentId as User;
-  return typeof s === 'object' ? `${s.firstName} ${s.lastName}` : '—';
+  const s = order.studentId as User | null;
+  return s?.firstName
+    ? `${s.firstName} ${s.lastName ?? ''}`.trim()
+    : '—';
 }
+
 function studentRoom(order: Order) {
-  const s = order.studentId as User;
-  return typeof s === 'object' ? s.roomNumber : '—';
+  const s = order.studentId as User | null;
+  return s?.roomNumber ?? '—';
 }
 
 export function AdminOrders() {
