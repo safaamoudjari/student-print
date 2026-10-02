@@ -1,20 +1,18 @@
-import fs from 'fs/promises';
 import { connectDB, disconnectDB } from '../config/db';
+import { deleteFromCloudinary } from '../config/cloudinary';
 import { Order } from '../models/Order';
 import { OrderFile } from '../models/OrderFile';
 import { getSettings } from '../models/Settings';
 
-// Deletes uploaded files for orders that have been "completed" for longer
-// than the configured retention period. Order metadata (order number,
-// prices, dates, status) is always kept — only the files on disk and their
-// database records are removed, and only for orders that reached a final
-// state, so an active order can never be affected by this job.
+// Deletes uploaded files (from Cloudinary + their DB records) for orders that
+// reached a final state (completed / cancelled) longer ago than the retention
+// period. Order metadata (number, prices, dates, status) is always kept.
 //
-// This is intentionally a script rather than an in-process timer, so you
-// can schedule it safely and predictably with your OS's own scheduler:
-//   Linux/macOS (cron), run once a day:
-//     0 3 * * * cd /path/to/server && npm run cleanup:files >> cleanup.log 2>&1
-// Run manually with: npm run cleanup:files
+// If a Cloudinary deletion fails, the file record and the order are left
+// untouched so the next run retries them (nothing is silently lost/leaked).
+//
+// Run manually:  npm run cleanup:files
+// Schedule it on Render (Cron Job) or GitHub Actions - see notes.
 async function run() {
   await connectDB();
 
@@ -28,30 +26,45 @@ async function run() {
   const cutoff = new Date(Date.now() - settings.fileRetentionDays * 24 * 60 * 60 * 1000);
 
   const eligibleOrders = await Order.find({
-    status: 'completed',
-    completedAt: { $lte: cutoff },
     filesDeletedAt: null,
+    $or: [
+      { status: 'completed', completedAt: { $lte: cutoff } },
+      { status: 'cancelled', cancelledAt: { $lte: cutoff } },
+    ],
   });
 
   let deletedFiles = 0;
+  let failedFiles = 0;
 
   for (const order of eligibleOrders) {
-    const files = await OrderFile.find({ orderId: order._id }).select('+storagePath');
+    const files = await OrderFile.find({ orderId: order._id }).select('+filePublicId +resourceType');
+    let allDeleted = true;
+
     for (const file of files) {
-      await fs.unlink(file.storagePath).catch(() => undefined);
-      await file.deleteOne();
-      deletedFiles += 1;
+      try {
+        await deleteFromCloudinary(file.filePublicId, file.resourceType);
+        await file.deleteOne();
+        deletedFiles += 1;
+      } catch (err) {
+        allDeleted = false;
+        failedFiles += 1;
+        console.error(`Failed to delete file ${file._id} from Cloudinary:`, (err as Error).message);
+      }
     }
-    order.filesDeletedAt = new Date();
-    await order.save();
+
+    if (allDeleted) {
+      order.filesDeletedAt = new Date();
+      await order.save();
+    }
   }
 
   console.log(
-    `Cleanup complete: removed ${deletedFiles} file(s) from ${eligibleOrders.length} completed order(s) older than ${settings.fileRetentionDays} day(s).`
+    `Cleanup complete: removed ${deletedFiles} file(s), ${failedFiles} failed (will retry), ` +
+      `from ${eligibleOrders.length} order(s) older than ${settings.fileRetentionDays} day(s).`
   );
 
   await disconnectDB();
-  process.exit(0);
+  process.exit(failedFiles > 0 ? 1 : 0);
 }
 
 run().catch((err) => {

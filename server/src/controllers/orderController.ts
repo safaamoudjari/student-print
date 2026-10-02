@@ -1,5 +1,7 @@
 import { Request, Response } from 'express';
 import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 import { z } from 'zod';
 import { Order } from '../models/Order';
 import { OrderFile } from '../models/OrderFile';
@@ -10,6 +12,9 @@ import { asyncHandler } from '../utils/asyncHandler';
 import { detectPageCount } from '../utils/pageCount';
 import { calculatePrice } from '../utils/priceCalculator';
 import { generateOrderNumber } from '../utils/orderNumber';
+import { uploadToCloudinary } from '../config/cloudinary';
+
+const HIDDEN_FILE_FIELDS = '-storagePath -fileUrl -filePublicId -resourceType';
 
 const optionsSchema = z.object({
   colorMode: z.enum(['bw', 'color']),
@@ -22,15 +27,8 @@ const optionsSchema = z.object({
 export const createOrder = asyncHandler(async (req: Request, res: Response) => {
   const files = (req.files as Express.Multer.File[]) || [];
 
-  // Clean up any files multer already wrote to disk before we bail out on a
-  // validation error, so rejected uploads don't pile up on disk.
-  const cleanup = async () => {
-    await Promise.all(files.map((f) => fs.unlink(f.path).catch(() => undefined)));
-  };
-
   const parsed = optionsSchema.safeParse(req.body);
   if (!parsed.success) {
-    await cleanup();
     throw new AppError('Please check your printing options.', 400);
   }
   const { colorMode, sides, copies, notes } = parsed.data;
@@ -41,11 +39,9 @@ export const createOrder = asyncHandler(async (req: Request, res: Response) => {
 
   const settings = await getSettings();
   if (files.length > settings.maxFilesPerOrder) {
-    await cleanup();
     throw new AppError(`You can upload a maximum of ${settings.maxFilesPerOrder} files per order.`, 400);
   }
   if (copies > settings.maxCopies) {
-    await cleanup();
     throw new AppError(`You can request a maximum of ${settings.maxCopies} copies.`, 400);
   }
 
@@ -54,15 +50,25 @@ export const createOrder = asyncHandler(async (req: Request, res: Response) => {
     try {
       requestedServices = JSON.parse(parsed.data.services);
     } catch {
-      await cleanup();
       throw new AppError('Invalid additional services selection.', 400);
     }
   }
 
-  // Detect a real page count for each file server-side. Never trust
-  // anything the client claims about page counts.
+  // الملف في الذاكرة، و detectPageCount يقرا من مسار ملف،
+  // فنكتبو مؤقتاً في tmp ونمسحو مباشرة بعد الحساب.
   const pageResults = await Promise.all(
-    files.map((file) => detectPageCount(file.path, file.mimetype))
+    files.map(async (file) => {
+      const tmpPath = path.join(
+        os.tmpdir(),
+        `${Date.now()}-${Math.random().toString(36).slice(2)}${path.extname(file.originalname).toLowerCase()}`
+      );
+      await fs.writeFile(tmpPath, file.buffer);
+      try {
+        return await detectPageCount(tmpPath, file.mimetype);
+      } finally {
+        await fs.unlink(tmpPath).catch(() => undefined);
+      }
+    })
   );
   const totalPages = pageResults.reduce((sum, r) => sum + r.pageCount, 0);
 
@@ -80,6 +86,9 @@ export const createOrder = asyncHandler(async (req: Request, res: Response) => {
     copies,
     selectedServices,
   });
+
+  // رفع الملفات لـ Cloudinary (بعد ما تأكدنا أن كل الفحوصات نجحت)
+  const stored = await Promise.all(files.map((file) => uploadToCloudinary(file)));
 
   const orderNumber = await generateOrderNumber();
 
@@ -107,8 +116,11 @@ export const createOrder = asyncHandler(async (req: Request, res: Response) => {
     files.map((file, i) => ({
       orderId: order._id,
       originalFileName: file.originalname,
-      storedFileName: file.filename,
-      storagePath: file.path,
+      storedFileName: stored[i].publicId,
+      storagePath: stored[i].publicId,
+      fileUrl: stored[i].url,
+      filePublicId: stored[i].publicId,
+      resourceType: stored[i].resourceType,
       mimeType: file.mimetype,
       fileSize: file.size,
       pageCount: pageResults[i].pageCount,
@@ -131,7 +143,7 @@ export const createOrder = asyncHandler(async (req: Request, res: Response) => {
 export const listMyOrders = asyncHandler(async (req: Request, res: Response) => {
   const orders = await Order.find({ studentId: req.user!._id }).sort({ createdAt: -1 });
   const orderIds = orders.map((o) => o._id);
-  const files = await OrderFile.find({ orderId: { $in: orderIds } }).select('-storagePath');
+  const files = await OrderFile.find({ orderId: { $in: orderIds } }).select(HIDDEN_FILE_FIELDS);
 
   const filesByOrder = new Map<string, typeof files>();
   for (const f of files) {
@@ -148,7 +160,7 @@ export const listMyOrders = asyncHandler(async (req: Request, res: Response) => 
 export const getMyOrder = asyncHandler(async (req: Request, res: Response) => {
   const order = await Order.findOne({ _id: req.params.id, studentId: req.user!._id });
   if (!order) throw new AppError('Order not found.', 404);
-  const files = await OrderFile.find({ orderId: order._id }).select('-storagePath');
+  const files = await OrderFile.find({ orderId: order._id }).select(HIDDEN_FILE_FIELDS);
   res.json({ order, files });
 });
 
